@@ -11,6 +11,41 @@ use termcolor::{Buffer, WriteColor};
 use crate::theme::Theme;
 use crate::{DemandOption, ctrlc, theme};
 
+/// Tracks which parts of the screen need redrawing
+#[derive(Debug, Default)]
+struct DirtyRegions {
+    title: bool,
+    description: bool,
+    options: HashSet<usize>,
+    help: bool,
+    filter: bool,
+    all: bool,
+}
+
+impl DirtyRegions {
+    fn mark_all(&mut self) {
+        self.all = true;
+    }
+
+    fn clear(&mut self) {
+        self.title = false;
+        self.description = false;
+        self.options.clear();
+        self.help = false;
+        self.filter = false;
+        self.all = false;
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.all
+            || self.title
+            || self.description
+            || !self.options.is_empty()
+            || self.help
+            || self.filter
+    }
+}
+
 /// Select multiple options from a list
 ///
 /// # Example
@@ -71,6 +106,8 @@ pub struct MultiSelect<'a, T> {
     cur_page: usize,
     capacity: usize,
     fuzzy_matcher: SkimMatcherV2,
+    dirty: DirtyRegions,
+    last_render: Option<String>,
 }
 
 impl<'a, T> MultiSelect<'a, T> {
@@ -96,6 +133,8 @@ impl<'a, T> MultiSelect<'a, T> {
             cur_page: 0,
             capacity: 0,
             fuzzy_matcher: SkimMatcherV2::default().use_cache(true).smart_case(),
+            dirty: DirtyRegions::default(),
+            last_render: None,
         };
         let max_height = ms.term.size().0 as usize;
         ms.capacity = max_height.max(8) - 6;
@@ -105,13 +144,16 @@ impl<'a, T> MultiSelect<'a, T> {
     /// Set the description of the selector
     pub fn description(mut self, description: &str) -> Self {
         self.description = description.to_string();
+        self.dirty.description = true;
         self
     }
 
     /// Add an option to the selector
     pub fn option(mut self, option: DemandOption<T>) -> Self {
+        let idx = self.options.len();
         self.options.push(option);
         self.pages = self.get_pages();
+        self.dirty.options.insert(idx);
         self
     }
 
@@ -120,7 +162,6 @@ impl<'a, T> MultiSelect<'a, T> {
         for option in options {
             self.options.push(option);
         }
-        self.pages = self.get_pages();
         self
     }
 
@@ -151,6 +192,7 @@ impl<'a, T> MultiSelect<'a, T> {
         self.filter = filter.to_string();
         self.cursor_x = self.filter.chars().count();
         self.pages = self.get_pages();
+        self.dirty.filter = true;
         self
     }
 
@@ -170,12 +212,17 @@ impl<'a, T> MultiSelect<'a, T> {
         self.max = self.max.min(self.options.len());
         self.min = self.min.min(self.max);
 
+        self.dirty.mark_all();
+
         loop {
-            self.clear()?;
-            let output = self.render()?;
-            self.term.write_all(output.as_bytes())?;
+            if self.dirty.is_dirty() {
+                self.render_incremental()?;
+                self.dirty.clear();
+            }
+
             self.term.flush()?;
-            self.height = output.lines().count() - 1;
+            self.height = self.last_render.as_ref().unwrap().lines().count() - 1;
+
             if self.filtering {
                 match self.term.read_key()? {
                     Key::ArrowLeft => self.handle_left()?,
@@ -188,6 +235,7 @@ impl<'a, T> MultiSelect<'a, T> {
                 }
             } else {
                 self.term.hide_cursor()?;
+
                 match self.term.read_key()? {
                     Key::ArrowDown | Key::Char('j') => self.handle_down()?,
                     Key::ArrowUp | Key::Char('k') => self.handle_up()?,
@@ -214,6 +262,7 @@ impl<'a, T> MultiSelect<'a, T> {
                             .filter(|o| o.selected)
                             .map(|o| o.label.to_string())
                             .collect::<Vec<_>>();
+
                         if selected.len() < self.min {
                             if self.min == 1 {
                                 self.err = Some("Please select an option".to_string());
@@ -221,8 +270,10 @@ impl<'a, T> MultiSelect<'a, T> {
                                 self.err =
                                     Some(format!("Please select at least {} options", self.min));
                             }
+                            self.dirty.help = true;
                             continue;
                         }
+
                         if selected.len() > self.max {
                             if self.max == 1 {
                                 self.err = Some("Please select only one option".to_string());
@@ -230,8 +281,10 @@ impl<'a, T> MultiSelect<'a, T> {
                                 self.err =
                                     Some(format!("Please select at most {} options", self.max));
                             }
+                            self.dirty.help = true;
                             continue;
                         }
+
                         self.clear()?;
                         self.term.show_cursor()?;
                         ctrlc_handle.close();
@@ -250,6 +303,22 @@ impl<'a, T> MultiSelect<'a, T> {
                 }
             }
         }
+    }
+
+    fn render_incremental(&mut self) -> io::Result<()> {
+        if self.dirty.all {
+            self.clear()?;
+            let output = self.render()?;
+            self.term.write_all(output.as_bytes())?;
+            self.last_render = Some(output);
+        } else {
+            let output = self.render()?;
+            self.clear()?;
+            self.term.write_all(output.as_bytes())?;
+            self.last_render = Some(output);
+        }
+
+        Ok(())
     }
 
     fn filtered_options(&self) -> Vec<&DemandOption<T>> {
@@ -281,24 +350,42 @@ impl<'a, T> MultiSelect<'a, T> {
 
     fn handle_down(&mut self) -> Result<(), io::Error> {
         let visible_options = self.visible_options();
+        let old_cursor = self.cursor;
+
         if self.cursor < visible_options.len().max(1) - 1 {
             self.cursor += 1;
         } else if self.pages > 0 && self.cur_page < self.pages - 1 {
             self.cur_page += 1;
             self.cursor = 0;
-            self.term.clear_to_end_of_screen()?;
+            self.dirty.mark_all();
+            return self.term.clear_to_end_of_screen();
         }
+
+        if old_cursor != self.cursor {
+            self.dirty.options.insert(old_cursor);
+            self.dirty.options.insert(self.cursor);
+        }
+
         Ok(())
     }
 
     fn handle_up(&mut self) -> Result<(), io::Error> {
+        let old_cursor = self.cursor;
+
         if self.cursor > 0 {
             self.cursor -= 1;
         } else if self.cur_page > 0 {
             self.cur_page -= 1;
             self.cursor = self.visible_options().len().max(1) - 1;
-            self.term.clear_to_end_of_screen()?;
+            self.dirty.mark_all();
+            return self.term.clear_to_end_of_screen();
         }
+
+        if old_cursor != self.cursor {
+            self.dirty.options.insert(old_cursor);
+            self.dirty.options.insert(self.cursor);
+        }
+
         Ok(())
     }
 
@@ -306,11 +393,14 @@ impl<'a, T> MultiSelect<'a, T> {
         if self.filtering {
             if self.cursor_x > 0 {
                 self.cursor_x -= 1;
+                self.dirty.filter = true;
             }
         } else if self.cur_page > 0 {
             self.cur_page -= 1;
+            self.dirty.mark_all();
             self.term.clear_to_end_of_screen()?;
         }
+
         Ok(())
     }
 
@@ -318,30 +408,41 @@ impl<'a, T> MultiSelect<'a, T> {
         if self.filtering {
             if self.cursor_x < self.filter.chars().count() {
                 self.cursor_x += 1;
+                self.dirty.filter = true;
             }
         } else if self.pages > 0 && self.cur_page < self.pages - 1 {
             self.cur_page += 1;
+
             if self.cursor_y > self.visible_options().len() - 1 {
                 self.cursor_y = self.visible_options().len() - 1;
             }
+
+            self.dirty.mark_all();
             self.term.clear_to_end_of_screen()?;
         }
+
         Ok(())
     }
 
     fn handle_toggle(&mut self) {
         self.err = None;
+
         let visible_options = self.visible_options();
+
         if visible_options.is_empty() {
             return;
         }
+
         let id = visible_options[self.cursor].id;
         let selected = visible_options[self.cursor].selected;
+
         self.options
             .iter_mut()
             .find(|o| o.id == id)
             .unwrap()
             .selected = !selected;
+
+        self.dirty.options.insert(self.cursor);
     }
 
     fn handle_toggle_all(&mut self) {
@@ -355,9 +456,11 @@ impl<'a, T> MultiSelect<'a, T> {
             .into_iter()
             .map(|o| o.id)
             .collect::<HashSet<_>>();
-        for opt in &mut self.options {
+
+        for (idx, opt) in self.options.iter_mut().enumerate() {
             if ids.contains(&opt.id) {
                 opt.selected = select;
+                self.dirty.options.insert(idx);
             }
         }
     }
@@ -365,19 +468,24 @@ impl<'a, T> MultiSelect<'a, T> {
     fn handle_start_filtering(&mut self) {
         self.err = None;
         self.filtering = true;
+        self.dirty.filter = true;
     }
 
     fn handle_stop_filtering(&mut self, save: bool) -> Result<(), io::Error> {
         self.filtering = false;
-
         let visible_options = self.visible_options();
+
         if !visible_options.is_empty() {
             self.cursor = self.cursor.min(self.visible_options().len() - 1);
         }
+
         if !save {
             self.filter.clear();
             self.reset_paging();
+            self.dirty.mark_all();
         }
+
+        self.dirty.filter = true;
         self.term.clear_to_end_of_screen()
     }
 
@@ -388,21 +496,26 @@ impl<'a, T> MultiSelect<'a, T> {
         self.cursor_y = 0;
         self.err = None;
         self.reset_paging();
+        self.dirty.mark_all();
         self.term.clear_to_end_of_screen()
     }
 
     fn handle_filter_backspace(&mut self) -> Result<(), io::Error> {
         let chars_count = self.filter.chars().count();
+
         if chars_count > 0 && self.cursor_x > 0 {
             let idx = self.get_char_idx(&self.filter, self.cursor_x - 1);
             self.filter.remove(idx);
         }
+
         if self.cursor_x > 0 {
             self.cursor_x -= 1;
         }
+
         self.cursor_y = 0;
         self.err = None;
         self.reset_paging();
+        self.dirty.mark_all();
         self.term.clear_to_end_of_screen()
     }
 
@@ -431,17 +544,20 @@ impl<'a, T> MultiSelect<'a, T> {
         } else {
             writeln!(out)?;
         }
+
         if !self.description.is_empty() || self.pages > 1 {
             out.set_color(&self.theme.description)?;
             write!(out, "{}", self.description)?;
             writeln!(out)?;
         }
+
         let max_label_len = self
             .visible_options()
             .iter()
             .map(|o| console::measure_text_width(&o.label))
             .max()
             .unwrap_or(0);
+
         for (i, option) in self.visible_options().into_iter().enumerate() {
             if self.cursor == i {
                 out.set_color(&self.theme.cursor)?;
@@ -449,6 +565,7 @@ impl<'a, T> MultiSelect<'a, T> {
             } else {
                 write!(out, "  ")?;
             }
+
             if option.selected {
                 out.set_color(&self.theme.selected_prefix_fg)?;
                 write!(out, "{}", self.theme.selected_prefix)?;
@@ -461,6 +578,7 @@ impl<'a, T> MultiSelect<'a, T> {
                 self.print_option_label(&mut out, option, max_label_len)?;
             }
         }
+
         if self.pages > 1 {
             out.set_color(&self.theme.description)?;
             writeln!(out, " (page {}/{})", self.cur_page + 1, self.pages)?;
@@ -468,7 +586,6 @@ impl<'a, T> MultiSelect<'a, T> {
 
         if self.filtering {
             out.set_color(&self.theme.input_cursor)?;
-
             write!(out, "/")?;
             out.reset()?;
 
@@ -480,15 +597,18 @@ impl<'a, T> MultiSelect<'a, T> {
                 write!(out, "{}", &self.filter[cursor_idx..cursor_idx + 1])?;
                 out.reset()?;
             }
+
             if cursor_idx + 1 < self.filter.len() {
                 out.reset()?;
                 write!(out, "{}", &self.filter[cursor_idx + 1..])?;
             }
+
             if cursor_idx >= self.filter.len() {
                 out.set_color(&self.theme.real_cursor_color(None))?;
                 write!(out, " ")?;
                 out.reset()?;
             }
+
             writeln!(out)?;
             out.reset()?;
         } else if !self.filter.is_empty() {
@@ -500,7 +620,6 @@ impl<'a, T> MultiSelect<'a, T> {
         }
 
         self.print_help_keys(&mut out)?;
-
         writeln!(out)?;
         out.reset()?;
 
